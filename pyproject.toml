@@ -68,6 +68,10 @@ build123d-mcp = "build123d_mcp.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/build123d_mcp"]
 
+[tool.hatch.build.targets.sdist]
+# Fork-only content (personal/) must never end up in a source distribution.
+exclude = ["personal/"]
+
 [dependency-groups]
 dev = [
     "pytest",
