@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>build123d live viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1e1e1e; overflow: hidden; font-family: system-ui, sans-serif; }
+  #canvas-wrap { position: absolute; inset: 0; }
+  #hud {
+    position: absolute; top: 12px; left: 12px; z-index: 10;
+    color: #ddd; font-size: 13px; display: flex; align-items: center; gap: 10px;
+  }
+  #status { display: flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 12px; background: #0006; }
+  #status .dot { width: 8px; height: 8px; border-radius: 50%; background: #888; }
+  #status.connected .dot { background: #4caf50; }
+  #status.reconnecting .dot { background: #ffb300; }
+  #status.rejected .dot { background: #e53935; }
+  button {
+    background: #333; color: #ddd; border: 1px solid #555; border-radius: 6px;
+    padding: 4px 10px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { background: #444; }
+  #token-form {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    z-index: 20; background: #2a2a2a; padding: 20px 24px; border-radius: 8px;
+    color: #ddd; display: none; flex-direction: column; gap: 10px; min-width: 260px;
+  }
+  #token-form input { padding: 6px 8px; border-radius: 4px; border: 1px solid #555; background: #1e1e1e; color: #eee; }
+</style>
+</head>
+<body>
+<div id="canvas-wrap"></div>
+<div id="hud">
+  <div id="status"><span class="dot"></span><span id="status-text">connecting…</span></div>
+  <button id="fit-view">Fit view</button>
+</div>
+<div id="token-form">
+  <div>Bridge token required (or open with <code>?token=...</code> in the URL).</div>
+  <input id="token-input" type="text" placeholder="token" />
+  <button id="token-submit">Connect</button>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+
+// --- token handling -------------------------------------------------------
+
+function getToken() {
+  const fromUrl = new URLSearchParams(location.search).get("token");
+  if (fromUrl) {
+    localStorage.setItem("viewer_bridge_token", fromUrl);
+    return fromUrl;
+  }
+  return localStorage.getItem("viewer_bridge_token") || null;
+}
+
+function promptForToken() {
+  return new Promise((resolve) => {
+    const form = document.getElementById("token-form");
+    const input = document.getElementById("token-input");
+    form.style.display = "flex";
+    document.getElementById("token-submit").onclick = () => {
+      const value = input.value.trim();
+      if (!value) return;
+      localStorage.setItem("viewer_bridge_token", value);
+      form.style.display = "none";
+      resolve(value);
+    };
+  });
+}
+
+// --- three.js scene setup --------------------------------------------------
+
+const wrap = document.getElementById("canvas-wrap");
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1e1e1e);
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 100000);
+camera.position.set(150, 150, 150);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+wrap.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(1, 2, 1.5);
+scene.add(dirLight);
+
+// Units are mm (per protocol header); a 100-unit grid with 10 divisions is
+// a reasonable default for small printed parts.
+const grid = new THREE.GridHelper(200, 20, 0x444444, 0x2a2a2a);
+scene.add(grid);
+
+window.addEventListener("resize", () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+function fitView() {
+  const box = new THREE.Box3();
+  let any = false;
+  for (const obj of shapes.values()) {
+    box.expandByObject(obj);
+    any = true;
+  }
+  if (!any) return;
+  const center = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3()).length() || 100;
+  controls.target.copy(center);
+  camera.position.copy(center).add(new THREE.Vector3(size, size, size).multiplyScalar(0.6));
+  camera.near = size / 100;
+  camera.far = size * 100;
+  camera.updateProjectionMatrix();
+}
+document.getElementById("fit-view").onclick = fitView;
+
+// --- scene state, keyed by shape name --------------------------------------
+
+const shapes = new Map(); // name -> Object3D
+const loader = new GLTFLoader();
+
+function clearScene() {
+  for (const obj of shapes.values()) scene.remove(obj);
+  shapes.clear();
+}
+
+function upsert(name, glbArrayBuffer) {
+  loader.parse(
+    glbArrayBuffer,
+    "",
+    (gltf) => {
+      const existing = shapes.get(name);
+      if (existing) scene.remove(existing);
+      scene.add(gltf.scene);
+      shapes.set(name, gltf.scene);
+      if (shapes.size === 1) fitView(); // frame the first shape automatically
+    },
+    (error) => console.error(`failed to parse glb for "${name}":`, error),
+  );
+}
+
+function remove(name) {
+  const obj = shapes.get(name);
+  if (obj) {
+    scene.remove(obj);
+    shapes.delete(name);
+  }
+}
+
+// --- WebSocket connection ---------------------------------------------------
+
+const statusEl = document.getElementById("status");
+const statusText = document.getElementById("status-text");
+
+function setStatus(kind, text) {
+  statusEl.className = kind;
+  statusText.textContent = text;
+}
+
+let pendingHeader = null;
+
+function bridgeUrl(token) {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  // Matches bridge.py's own --ws-port default (8765); override with ?ws=host:port
+  // if the bridge was started with a different port.
+  const override = new URLSearchParams(location.search).get("ws");
+  const hostport = override || `${location.hostname}:8765`;
+  return `${proto}://${hostport}/?token=${encodeURIComponent(token)}`;
+}
+
+async function connect() {
+  let token = getToken();
+  if (!token) token = await promptForToken();
+
+  setStatus("reconnecting", "connecting…");
+  const ws = new WebSocket(bridgeUrl(token));
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => setStatus("connected", "connected");
+
+  ws.onmessage = (event) => {
+    if (typeof event.data === "string") {
+      pendingHeader = JSON.parse(event.data);
+      const { type, name } = pendingHeader;
+      if (type === "HELLO") {
+        clearScene();
+      } else if (type === "REMOVE") {
+        remove(name);
+      } else if (type === "RESET") {
+        clearScene();
+        setStatus("reconnecting", "scene cleared (server reset)");
+      }
+      // UPSERT: wait for the paired binary frame before acting.
+    } else {
+      if (pendingHeader && pendingHeader.type === "UPSERT") {
+        upsert(pendingHeader.name, event.data);
+      }
+      pendingHeader = null;
+    }
+  };
+
+  ws.onclose = (event) => {
+    if (event.code === 1008) {
+      setStatus("rejected", `auth rejected: ${event.reason || "bad token"}`);
+      localStorage.removeItem("viewer_bridge_token");
+      promptForToken().then(connect);
+      return;
+    }
+    setStatus("reconnecting", "disconnected, retrying…");
+    setTimeout(connect, 1000);
+  };
+
+  ws.onerror = () => ws.close();
+}
+
+connect();
+</script>
+</body>
+</html>
